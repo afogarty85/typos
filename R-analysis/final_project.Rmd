@@ -1,0 +1,580 @@
+---
+title: "Final Project"
+date: "04/03/2021"
+author: "Cris Benge, Andrew Fogarty, Stone Jiang"
+output: pdf_document
+---
+
+```{r load data, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyr)
+library(dplyr)
+library(data.table)
+options(datatable.WhenJisSymbolThenCallingScope=TRUE)
+library(knitr)
+library(stringr)
+library(ggplot2)
+
+library(sandwich)
+library(lmtest)
+
+library(cobalt)
+
+#read in the data
+d <- fread("results_04092021_2.csv")
+
+#get all of the useful descriptions
+description <- head(d, 1)
+
+#Eliminate all preview responses
+d <- d[Status == 'IP Address']
+
+#Remove entries where our social media post was not shown
+d <- d[social_media_credability_group %in% c('control', 'phonological', 'typographical')]
+
+#remove tests
+d <- d[Q2.1 != 'test']
+
+#generate a row ID to easily merge in new information in long format
+d$ROWID <- seq(dim(d)[1])
+
+#pull out other demographics questions
+d_demo <- d [, grepl("ROWID", x=colnames(d)) | grepl("Q2", x=colnames(d)) | grepl("StartDate", x=colnames(d)), with = FALSE]
+
+#Use regex to pull out columns associated with our data
+#Don't need click data, just page submit data
+d <- d [, grepl("ROWID", x = colnames(d)) | !grepl(pattern="Click", x = colnames(d)) & (grepl(pattern="Q3[1-4]", x=colnames(d)) | grepl(pattern="social_media_cre", x=colnames(d))),
+        with = FALSE]
+#bind together
+#d <- cbind(d_us, d_demo)
+```
+
+```{r gather all data from each category into one frame}
+#process the control group
+processed_data <- d[social_media_credability_group == 'control', as.vector(colSums(d[social_media_credability_group == 'control'] != '') > 0), with = FALSE]
+
+#process treatment groups, keeping names of the control group
+for (group in c('phonological', 'typographical')) {
+    processed_data <- rbind(processed_data, 
+                            setNames(d[social_media_credability_group == group, 
+                                       as.vector(colSums(d[social_media_credability_group == group] != '') > 0), 
+                                       with = FALSE], 
+                                     names(processed_data)))
+}
+```
+
+```{r Process Field Names}
+#list of prompts we have
+prompt_order <- c('Diet',
+                  'Sports',
+                  'Accident',
+                  'Music',
+                  'Science',
+                  'Mind')
+
+#question types and submission times for each prompt
+question_type <- c('PromptTime',
+                   'QuestionTime',
+                   'Knowledge',
+                   'Length',
+                   'Interest',
+                   'Effective',
+                   'Intelligence',
+                   'Writing',
+                   'Meet',
+                   'Errors')
+
+#gather colnames and append to cnames
+cnames <- outer(question_type, prompt_order, paste)
+cnames <- append(cnames, c('Treatment', 'ROWID'))
+colnames(processed_data) <- cnames
+```
+
+```{r pivot longer based on each question}
+merge_prompt <- function(pdata, prompt){
+  ndata <- processed_data[, grepl("ROWID", x = colnames(processed_data)) | grepl(prompt, colnames(processed_data)) | grepl('Treatment', colnames(processed_data)), with = FALSE]
+  colnames(ndata) <- append(question_type, c('Treatment', 'ROWID'))
+  ndata[, Prompt := prompt]
+  return (rbind(pdata,ndata))
+}
+
+pdata <- processed_data[, grepl("ROWID", x = colnames(processed_data)) | grepl('Diet', colnames(processed_data)) | grepl('Treatment', colnames(processed_data)), with = FALSE]
+colnames(pdata) <- append(question_type, c('Treatment', 'ROWID'))
+pdata[, Prompt := 'Diet']
+
+for (prompt in prompt_order[2:6]) {
+  pdata <- merge_prompt(pdata, prompt)
+}
+```
+
+```{r process field types}
+#Set the time to completion as numeric
+pdata[, PromptTime := as.numeric(PromptTime)]
+pdata[, QuestionTime := as.numeric(QuestionTime)]
+
+#convert matrix questions to factor levels to be numeric
+pdata[,Interest := as.numeric(ifelse(Interest == '7 (highest)', 7, ifelse(Interest == '1 (lowest)', 1, Interest)))]
+pdata[,Effective := as.numeric(ifelse(Effective == '7 (highest)', 7, ifelse(Effective == '1 (lowest)', 1, Effective)))]
+pdata[,Intelligence := as.numeric(ifelse(Intelligence == '7 (highest)', 7, ifelse(Intelligence == '1 (lowest)', 1, Intelligence)))]
+pdata[,Writing := as.numeric(ifelse(Writing == '7 (highest)', 7, ifelse(Writing == '1 (lowest)', 1, Writing)))]
+pdata[,Meet := as.numeric(ifelse(Meet == '7 (highest)', 7, ifelse(Meet == '1 (lowest)', 1, Meet)))]
+
+#code the knowledge field as correct or incorrect
+correct_regex <- "Keto|Gold|Driving|Chicago, IL|0|Podcast"
+pdata[, Knowledge := as.numeric(grepl(correct_regex, pdata$Knowledge))]
+
+#capitalize treatment groups
+pdata$Treatment <- str_to_title(pdata$Treatment)
+```
+
+
+```{r Generate features for each post and merge based on question type}
+post_features <- data.table(post = c('Diet', 'Sports', 'Accident', 'Music', 'Science', 'Mind'),
+                            length = c(96, 38, 52, 75, 48, 40),
+                            typo_mistakes = c(0, 2, 1, 5, 2, 1),
+                            phono_mistakes = c(0, 2, 1, 7, 1, 1))
+
+#merge the lengths
+pdata <- merge(pdata, post_features[, .(post, length)], by.x='Prompt', by.y='post')
+
+#merge in the number of mistakes each post had
+control <- pdata[Treatment == 'Control']
+control$mistakes <- 0
+
+typo <- pdata[Treatment == 'Typographical']
+typo <- merge(typo, post_features[,.(post, typo_mistakes)], by.x = 'Prompt', by.y = 'post')
+setnames(typo, 'typo_mistakes', 'mistakes')
+
+phono <- pdata[Treatment == 'Phonological']
+phono <- merge(phono, post_features[,.(post, phono_mistakes)], by.x = 'Prompt', by.y = 'post')
+setnames(phono, 'phono_mistakes', 'mistakes')
+
+pdata <- rbind(control, typo, phono)
+```
+
+```{r Process and merge in demographics features}
+#demographics data
+demo_names <- c('Q2.1', 'Q2.2', 'Q2.3', 'Q2.4', 'Q2.6', 'Q2.7', 'Q2.8', 'Q2.14', 'Q2.18_1', 'Q.2.18_2','ROWID', "Start Date")
+d_demo <- d_demo[,.(Q2.1,Q2.2,Q2.3,Q2.4,Q2.6,Q2.7,Q2.8,Q2.14,Q2.18_1,Q2.18_2,ROWID,StartDate)]
+new_names <- c("Year", "Gender", "English", "Race", "Country", "State", "Student", "Degree", "ReadSocialMedia", "WriteSocialMedia",'ROWID', "Start Date")
+
+colnames(d_demo) <- new_names
+
+#merge in demographics features into data for each question
+pdata <- merge(pdata, d_demo, on = ROWID)
+```
+
+
+```{r NA features}
+#rows with NA
+pdata[rowSums(is.na(pdata)) > 0,] 
+
+#go ahead and remove these rows. The individual did not finish
+pdata <- pdata[rowSums(is.na(pdata)) == 0,] 
+```
+
+```{r additional features}
+#words per minute read for each post
+pdata[, wpm := length/(PromptTime/60)]
+```
+
+```{r clean the data before splitting}
+#pdata$Year
+
+#encode as number, replace obvious 19996, then set as age or OOC
+year <- as.numeric(pdata$Year)
+year <- ifelse(year == 19996, 1996,
+               ifelse(year > 2021 | year < 1900, NA, year)
+              )
+age <- 2021 - year
+age <- ifelse(is.na(age), 0, age)
+
+#bin age by buckets
+#0-17 (includes unknown)
+#18-25
+#26-30
+#31-35
+#36-40
+#41+
+age_bins <- cut(age, breaks = c(-1,17,25,30,35,40,100), labels = c('unknown','18-25','26-30','31-35','36-40','41+'))
+pdata$age <- age
+pdata$age_bins <- age_bins
+
+
+#mech turk vs berkeley
+pdata$StartDate <- as.Date(pdata$`Start Date`)
+pdata$isMechTurk <- ifelse(pdata$StartDate < as.Date("2021-04-06"), 1, 0)
+
+#Country
+pdata$isUS <- ifelse(pdata$Country == "United States of America" , 1, 0)
+```
+
+```{r noncompliers}
+##add final filtering stages
+#calculate variance of responses to each question and only take responses with var > 0
+pdata$response_var <- apply(pdata[,.(Interest, Effective, Intelligence, Writing, Meet)], 1, var) 
+#pdata <- pdata[response_var > 0]
+
+#wmp
+#pdata <- pdata[wpm > 50  & wpm < 500]
+```
+
+```{r output to cleaned dataset}
+#write.csv(pdata, '/Users/stonejiang/Desktop/Stone/Berkeley_MIDS/Causal_Inference/final_project/final_data_cleaned.csv')
+```
+
+#Analysis starts
+
+```{r split across treatment and control questions}
+control_q <- pdata[Prompt == 'Diet']
+treatment_q <- pdata[Prompt != 'Diet']
+```
+
+#Placebo tests
+
+```{r Mech Turk}
+model_mechturk_control <- control_q[isMechTurk == 1, lm(Intelligence ~ Treatment)]
+coeftest(model_mechturk_control, vcov. = vcovHC)
+```
+
+The randomization was not great for MechTurk. We will exclude this data from the analysis.
+
+```{r Placebo Berkeley Data}
+model_ucb_control <- control_q[isMechTurk == 0, lm(Intelligence ~ Treatment)]
+coeftest(model_ucb_control, vcov. = vcovHC)
+```
+Great there's no issues here.
+
+#Baseline model
+
+```{r Baseline model for Berkeley students}
+treatment_ucb <- treatment_q[isMechTurk == 0]
+
+model_ucb_treatment <- treatment_ucb[, lm(Intelligence ~ Treatment)]
+coeftest(model_ucb_treatment, vcov. = vcovHC)
+
+library(stargazer)
+stargazer(model_ucb_treatment,
+          se = list(sqrt(diag(vcovHC(model_ucb_treatment, type = "HC1")))), type="text", column.labels = c("Baseline"))
+```
+
+Highly statistically significant.
+
+#Model with post properties
+
+Properties include the Prompt type, "length" of the post. Perfectly collinear with other things like order of post, etc.
+```{r model with post properties (including order)}
+model_ucb_treatment_post <- treatment_ucb[, lm(Intelligence ~ Treatment + length)]
+coeftest(model_ucb_treatment_post, vcov. = vcovHC)
+```
+
+SE decreases slightly, estimates don't change.
+
+#Model controlling for demographics
+
+```{r model demographics}
+model_ucb_treatment_demo <- treatment_ucb[, lm(Intelligence ~ Treatment + length + Gender + English + Race + isUS + Degree + age_bins + ReadSocialMedia + WriteSocialMedia)]
+coeftest(model_ucb_treatment_demo, vcov. = vcovHC)
+
+stargazer(model_ucb_treatment, model_ucb_treatment_demo,
+          se = list(sqrt(diag(vcovHC(model_ucb_treatment, type = "HC1"))),
+                    sqrt(diag(vcovHC(model_ucb_treatment_demo, type = "HC1")))), type="text", column.labels = c("Baseline","Demographics"))
+```
+Even including all of these variables there's no change in significance, and estimate of treatment effect improves.
+
+#Model with pretreatment variables
+```{r Pretreatment variables}
+treatment_q <- merge(treatment_q, control_q, on='ROWID', suffixes = c("",".pretreat"))
+treatment_ucb <- treatment_q[isMechTurk == 0]
+
+model_ucb_treatment_pretreat <- treatment_ucb[, lm(Intelligence ~ Treatment + length + Gender + English + Race + isUS + Degree + age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat)]
+coeftest(model_ucb_treatment_pretreat, vcov. = vcovHC)
+
+stargazer(model_ucb_treatment, model_ucb_treatment_pretreat,
+          se = list(sqrt(diag(vcovHC(model_ucb_treatment, type = "HC1"))),
+                    sqrt(diag(vcovHC(model_ucb_treatment_pretreat, type = "HC1")))), 
+          type="text", 
+          column.labels = c("Baseline","Pretreatment"),
+          omit = c("length", "Gender", "English", "Race", "isUS", "Degree", "age_bins", "ReadSocialMedia",  "WriteSocialMedia"))
+```
+Works still
+
+#Model -- does other experiment on social media affect ours??
+
+**Need to figure out how to do this in Qualtrics**
+
+#Model gender matter?
+
+```{r hetero gender}
+treatment_ucb$Gender <- relevel(factor(treatment_ucb$Gender), 'Cisgender Woman')
+model_ucb_treatment_gender_h <- treatment_ucb[, lm(Intelligence ~ Treatment + Gender + English + Race + isUS + Degree + age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat + Gender:Treatment)]
+coeftest(model_ucb_treatment_gender_h, vcov. = vcovHC)
+
+
+```  
+No interactions are statistically significant. 
+
+```{r hetero read social media}
+model_ucb_treatment_read_pre <- treatment_ucb[, lm(Intelligence ~ Treatment + length + Gender + English + Race + isUS + Degree + age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat)]
+#stargazer(model_ucb_treatment_read,
+#          se = list(sqrt(diag(vcovHC(model_ucb_treatment_read, type = "HC1")))),
+#          type="text", 
+#          column.labels = c("Baseline"),
+#          omit = c("length", "Gender", "English", "Race", "isUS", "Degree", "age_bins", "Writing.pretreat",  "WriteSocialMedia", "Interest.pretreat", "Effective.pretreat", "Intelligence.pretreat"))
+
+levels <- c("More than once a day", "Daily", "Weekly", "Less than Weekly")
+
+p_estimates <- c()
+p_se <- c()
+
+t_estimates <- c()
+t_se <- c()
+
+for (level in levels) {
+  treatment_ucb$ReadSocialMedia <- relevel(factor(treatment_ucb$ReadSocialMedia), level)
+  model_ucb_treatment_read <- treatment_ucb[, lm(Intelligence ~ Treatment + Gender + length + English + Race + isUS + Degree + age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat + ReadSocialMedia:Treatment)]
+  
+  ctest <- coeftest(model_ucb_treatment_read, vcov. = vcovHC)
+  p_estimates <- append(p_estimates, ctest[2,1])
+  p_se <- append(p_se, ctest[2,2])
+  t_estimates <- append(t_estimates, ctest[3,1])
+  t_se <- append(t_se, ctest[3,2])
+  
+}
+
+p_upper <- p_estimates + 1.96*p_se
+p_lower <- p_estimates - 1.96*p_se
+
+t_upper <- t_estimates + 1.96*t_se
+t_lower <- t_estimates - 1.96*t_se
+
+p_avg <- coef(model_ucb_treatment_read_pre)[2]
+t_avg <- coef(model_ucb_treatment_read_pre)[3]
+
+p_data <- data.frame(levels = levels, p_estimate = p_estimates, p_lower = p_lower, p_upper = p_upper, errors = 1.96*p_se)
+
+t_data <- data.frame(levels = levels, t_estimate = t_estimates, t_lower = t_lower, t_upper = t_upper, errors = 1.96*t_se)
+x <- factor(levels, levels = c("More than once a day", "Daily", "Weekly", "Less than Weekly") )
+
+ggplot(p_data, aes(x=x, y=p_estimate,)) + 
+    geom_errorbar(aes(ymin=p_estimate - errors, ymax=p_estimate + errors), colour="black", width=.1) +
+    #geom_line() +
+    geom_point(size=3)+
+    ggtitle("Treatment effect based on how often someone reads social media") +
+    geom_hline(yintercept = p_avg, linetype="dashed", color = "red")+
+    ylab("Phonological Estimate") +
+    geom_hline(yintercept = 0, linetype="dashed", color = "green")+
+    #scale_x_discrete(labels= levels) +
+    theme_classic()
+```  
+
+```{r}
+ggplot(t_data, aes(x=x, y=t_estimate)) + 
+    geom_errorbar(aes(ymin=t_estimate - errors, ymax=t_estimate + errors), colour="black", width=.1) +
+    #geom_line() +
+    geom_point(size=3)+
+    ggtitle("Treatment effect based on how often someone reads social media") +
+    ylab("Typographical Estimate") +
+    geom_hline(yintercept = t_avg, linetype="dashed", color = "red")+
+    geom_hline(yintercept = 0, linetype="dashed", color = "green")+
+    scale_x_discrete(labels= levels)+
+    theme_classic()
+```
+
+```{r hetero write social media}
+model_ucb_treatment_read_pre <- treatment_ucb[, lm(Intelligence ~ Treatment + Gender + English + Race + isUS + Degree + age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat)]
+
+#stargazer(model_ucb_treatment_read,
+#          se = list(sqrt(diag(vcovHC(model_ucb_treatment_read, type = "HC1")))),
+#          type="text", 
+#          column.labels = c("Baseline"),
+#          omit = c("length", "Gender", "English", "Race", "isUS", "Degree", "age_bins", "Writing.pretreat",  "WriteSocialMedia", "Interest.pretreat", "Effective.pretreat", "Intelligence.pretreat"))
+
+levels <- c("More than once a day", "Daily", "Less than Weekly", "Weekly")
+
+p_estimates <- c()
+p_se <- c()
+
+t_estimates <- c()
+t_se <- c()
+
+for (level in levels) {
+  treatment_ucb$WriteSocialMedia <- relevel(factor(treatment_ucb$WriteSocialMedia), level)
+  model_ucb_treatment_read <- treatment_ucb[, lm(Intelligence ~ Treatment + Gender + length + English + Race + isUS + Degree + age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat + WriteSocialMedia:Treatment)]
+  
+  ctest <- coeftest(model_ucb_treatment_read, vcov. = vcovHC)
+  p_estimates <- append(p_estimates, ctest[2,1])
+  p_se <- append(p_se, ctest[2,2])
+  t_estimates <- append(t_estimates, ctest[3,1])
+  t_se <- append(t_se, ctest[3,2])
+  
+}
+
+p_upper <- p_estimates + 1.96*p_se
+p_lower <- p_estimates - 1.96*p_se
+
+t_upper <- t_estimates + 1.96*t_se
+t_lower <- t_estimates - 1.96*t_se
+
+p_avg <- coef(model_ucb_treatment_read_pre)[2]
+t_avg <- coef(model_ucb_treatment_read_pre)[3]
+
+p_data <- data.frame(levels = levels, p_estimate = p_estimates, p_lower = p_lower, p_upper = p_upper, errors = 1.96*p_se)
+
+t_data <- data.frame(levels = levels, t_estimate = t_estimates, t_lower = t_lower, t_upper = t_upper, errors = 1.96*t_se)
+  
+ggplot(p_data, aes(x=levels, y=p_estimate)) + 
+    geom_errorbar(aes(ymin=p_estimate - errors, ymax=p_estimate + errors), colour="black", width=.1) +
+    geom_line() +
+    geom_point(size=3)+
+    ggtitle("Treatment effect based on how often someone writes social media") +
+    geom_hline(yintercept = p_avg, linetype="dashed", color = "red")+
+    ylab("Phonological Estimate") +
+    geom_hline(yintercept = 0, linetype="dashed", color = "green")+
+    scale_x_discrete(labels= levels) +
+    theme_classic()
+```
+
+```{r}
+ggplot(t_data, aes(x=levels, y=t_estimate)) + 
+    geom_errorbar(aes(ymin=t_estimate - errors, ymax=t_estimate + errors), colour="black", width=.1) +
+    geom_line() +
+    geom_point(size=3)+
+    ggtitle("Treatment effect based on how often someone writes social media") +
+    ylab("Typographical Estimate") +
+    geom_hline(yintercept = t_avg, linetype="dashed", color = "red")+
+    geom_hline(yintercept = 0, linetype="dashed", color = "green")+
+    scale_x_discrete(labels= levels)+
+    theme_classic()
+```
+
+#Model age bin matter?
+
+```{r hetero age}
+model_ucb_treatment_gender_h <- treatment_ucb[, lm(Intelligence ~ Treatment  + length + Gender + English + Race + isUS + Degree + age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat + age_bins:Treatment)]
+coeftest(model_ucb_treatment_gender_h, vcov. = vcovHC)
+```
+
+#Model answer question correctly and notice mistakes?
+
+```{r}
+treatment_ucb[, table(Treatment, Knowledge)]
+```
+
+```{r }
+treatment_ucb$CorrectlyNoticedErrors <- ifelse(treatment_ucb$Errors == "None or did not notice any",
+                                               ifelse(treatment_ucb$mistakes == 0, 1, 0),
+                                               ifelse(treatment_ucb$mistakes == 1, 1, 0))
+
+treatment_ucb[, table(Treatment, CorrectlyNoticedErrors)]
+```
+
+In control, much higher proportion correctly noticed these errors.
+
+Warning: Could be bad control.
+
+```{r knowledge and mistakes recognize}
+model_ucb_treatment_mistakes <- treatment_ucb[, lm(Intelligence ~ Treatment  + length + Gender + English + Race + isUS + Degree +age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat + Knowledge + CorrectlyNoticedErrors)]
+coeftest(model_ucb_treatment_mistakes, vcov. = vcovHC)
+```
+
+
+#Covariate balance check to make sure randomization worked properly
+
+```{r}
+#using cobalt
+
+cobalt_pdata <- pdata[, .(Gender,length,English, Race, isUS, Degree, age_bins, ReadSocialMedia, WriteSocialMedia)]
+
+bal.tab(cobalt_pdata, treat = pdata$Treatment, s.d.denom = 'pooled', thresholds = c(m = .1, v = 2), imbalanced.only = TRUE)
+```
+
+#Writing and Effectiveness as secondary outcomes
+
+```{r writing}
+model_ucb_treatment_writing <- treatment_ucb[, lm(Writing ~ Treatment  + length + Gender + English + Race + isUS + Degree +age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat)]
+coeftest(model_ucb_treatment_writing, vcov. = vcovHC)
+```
+Writing has the same pattern as intelligence.
+
+```{r effective}
+model_ucb_treatment_effective <- treatment_ucb[, lm(Effective ~ Treatment  + length + Gender + English + Race + isUS + Degree +age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Writing.pretreat + Interest.pretreat + Effective.pretreat)]
+coeftest(model_ucb_treatment_effective, vcov. = vcovHC)
+```
+
+Phonological seems to affect the effectiveness, but typos not necessarily. Interesting as typos don't confuscate meaning as the intended word is often easily recognized.
+
+```{r stargazer_writing_effective}
+stargazer(model_ucb_treatment_writing, model_ucb_treatment_effective,
+          column.labels = c("Writing","Effective"),
+          omit = c("length", "Gender", "English", "Race", "isUS", "Degree", "age_bins", 
+                   "ReadSocialMedia",  "WriteSocialMedia", "Intelligence.pretreat", "Writing.pretreat",
+                   "Interest.pretreat", "Effective.pretreat", "Constant"),
+          type = 'text')
+```
+
+
+### Proportional Odds model
+
+```{r polr}
+library(MASS)
+library(car)
+
+treatment_ucb$intelligence.factor <- factor(treatment_ucb$Intelligence, levels = c(1,2,3,4,5,6,7), ordered = TRUE)
+polr_model_no_controls <- polr(intelligence.factor ~ Treatment, method = "logistic", data = data.frame(treatment_ucb), Hess = TRUE)
+
+polr_model_controls <- polr(intelligence.factor ~ Treatment  + length + Gender + English + Race + isUS + Degree +age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Interest.pretreat + Writing.pretreat +Effective.pretreat, method = "logistic", data = data.frame(treatment_ucb), Hess = TRUE)
+
+
+stargazer(polr_model_no_controls, polr_model_controls,
+          column.labels = c("No controls","With controls"),
+          omit = c("length", "Gender", "English", "Race", "isUS", "Degree", "age_bins", 
+                   "ReadSocialMedia",  "WriteSocialMedia"),
+          type = 'text')
+```
+
+Define subset of compliers who actually read the post.
+```{r compliance}
+#If subjects noticed errors in control, Defier
+#If subjects did not notice error in either treatment, Never Taker
+
+#Additionally, for treatment, define compliance as having read the post and noticed the mistakes
+#more than 50 words per minute (focused on reading)
+#less than 500 words per minute
+
+#treatment assignment
+treatment_ucb$treat_assigned <- ifelse(treatment_ucb$Treatment == 'Control', 0, 1)
+
+#noticed errors? If so, this indicates they received "treatment"
+treat_received_errors <- ifelse(treatment_ucb$Errors == "None or did not notice any", 0, 1)
+
+
+#add wpm requirement for treatment
+treat_received_wpm <- ifelse(treatment_ucb$wpm > 50 & treatment_ucb$wpm < 500, 1, 0)
+
+#actually received treatment? 
+#If they correctly noticed error (0 for control group, not 0 for treatment group) AND was within reasonable wpm
+treat_received <- as.numeric(treat_received_errors & treat_received_wpm)
+
+treatment_ucb$treat_received <- treat_received
+treatment_ucb[,table(treat_received), by = Treatment]
+```
+A large portion of control received treatment (they said they noticed spelling errors), so actually this is more of a concern. We have two-sided noncompliance.
+
+```{r compliance regression}
+prev.model <- treatment_ucb[, lm(Intelligence ~ Treatment + length + Gender + English + Race + isUS + Degree +age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Interest.pretreat + Writing.pretreat +Effective.pretreat)]
+#Typographical
+stage1 <- treatment_ucb[Treatment != 'Phonological', lm(treat_received ~ treat_assigned + length + Gender + English + Race + isUS + Degree +age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Interest.pretreat + Writing.pretreat +Effective.pretreat)]
+cace_estimate <- stage1$fitted.values
+typo.model <- treatment_ucb[Treatment != 'Phonological', lm(Intelligence ~ cace_estimate + length + Gender + English + Race + isUS + Degree +age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Interest.pretreat + Writing.pretreat +Effective.pretreat)]
+
+#Phonological
+stage1 <- treatment_ucb[Treatment != 'Typographical', lm(treat_received ~ treat_assigned + length + Gender + English + Race + isUS + Degree +age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Interest.pretreat + Writing.pretreat +Effective.pretreat)]
+cace_estimate <- stage1$fitted.values
+phono.model <- treatment_ucb[Treatment != 'Typographical', lm(Intelligence ~ cace_estimate + length + Gender + English + Race + isUS + Degree +age_bins + ReadSocialMedia + WriteSocialMedia + Intelligence.pretreat + Interest.pretreat + Writing.pretreat +Effective.pretreat)]
+
+stargazer(typo.model, phono.model, type = 'text', column.labels = c("Typographical", "Phonological"),
+          omit = c("length", "Gender", "English", "Race", "isUS", "Degree", "age_bins", 
+                   "ReadSocialMedia",  "WriteSocialMedia", "Intelligence.pre0treat", "Writing.pretreat",
+                   "Interest.pretreat", "Effective.pretreat", "Constant"))
+```
